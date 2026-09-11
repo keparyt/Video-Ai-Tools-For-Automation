@@ -24,6 +24,7 @@ def main():
     p.add_argument("--skip-vad",action="store_true")
     p.add_argument("--skip-diarize",action="store_true")
     p.add_argument("--force",action="store_true",help="Delete the existing workflow output before starting")
+    p.add_argument("--live",action="store_true",help="Print every accepted transcription segment immediately")
     args=p.parse_args()
     video=args.video.resolve(); out=(args.output_dir or video.with_name(video.stem+"_transcript")).resolve()
     if args.force and out.exists():
@@ -31,7 +32,12 @@ def main():
     out.mkdir(parents=True,exist_ok=True)
     audio=out/"audio_16k_mono.wav"; transcript=out/"transcript.json"; aligned=out/"aligned.json"; diar=out/"diarization.json"
     common=["--output-dir",str(out)]
-    if args.stage in ("all","transcribe"): call("transcribe.py",[str(video),*common,"--model",args.model,"--device",args.device,"--beam-size",str(args.beam_size),*( ["--language",args.language] if args.language else [] ),*( ["--compute-type",args.compute_type] if args.compute_type else [] )])
+    if args.stage in ("all","transcribe"):
+        transcribe_args=[str(video),*common,"--model",args.model,"--device",args.device,"--beam-size",str(args.beam_size)]
+        if args.language: transcribe_args += ["--language",args.language]
+        if args.compute_type: transcribe_args += ["--compute-type",args.compute_type]
+        if args.live: transcribe_args += ["--live"]
+        call("transcribe.py",transcribe_args)
     if args.stage in ("all","vad") and not args.skip_vad: call("vad.py",["--input",str(audio),*common])
     if args.stage in ("all","align"): call("align.py",["--transcript",str(transcript),"--audio",str(audio),*common,"--device",args.device,*( ["--language",args.language] if args.language else [] ),*( ["--compute-type",args.compute_type] if args.compute_type else [] )])
     if args.stage in ("all","diarize") and not args.skip_diarize: call("diarize.py",["--audio",str(audio),*common])
