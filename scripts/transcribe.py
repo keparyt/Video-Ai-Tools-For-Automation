@@ -4,6 +4,8 @@
 Pipeline: FFmpeg audio extraction -> faster-whisper large-v3 -> optional
 WhisperX alignment -> SRT/VTT/TXT/JSON output. Everything runs locally.
 
+AI model/cache files are stored in <current working directory>\\aimodels.
+
 Example:
     python scripts/transcribe.py video.mp4
     python scripts/transcribe.py video.mp4 --language fr --output-dir output
@@ -23,9 +25,18 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
+
+# Keep Hugging Face/faster-whisper model files local to the project working
+# directory instead of C:\\Users\\<user>\\.cache. This must happen before
+# importing faster_whisper/huggingface_hub.
+AI_MODELS_DIR = Path.cwd() / "aimodels"
+AI_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_HOME", str(AI_MODELS_DIR))
+os.environ.setdefault("HF_HUB_CACHE", str(AI_MODELS_DIR / "hub"))
+os.environ.setdefault("HF_ASSETS_CACHE", str(AI_MODELS_DIR / "assets"))
+os.environ.setdefault("XDG_CACHE_HOME", str(AI_MODELS_DIR / "xdg"))
 
 try:
     from faster_whisper import WhisperModel
@@ -197,7 +208,8 @@ def main() -> int:
     duration = media_duration(video)
     print(f"\nVIDEO:    {video}")
     print(f"DURATION: {fmt_time(duration, False)}")
-    print(f"OUTPUT:   {out}\n")
+    print(f"OUTPUT:   {out}")
+    print(f"AI MODELS:{AI_MODELS_DIR}\n")
 
     extract_audio(video, wav)
 
@@ -246,7 +258,6 @@ def main() -> int:
         save_checkpoint(checkpoint_path, {
             "source": str(video),
             "model": args.model,
-            "language": getattr(info, "language", None),
             "completed_end": segment.end,
             "segments": segments + new_segments,
         })
