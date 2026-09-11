@@ -1,22 +1,5 @@
 #!/usr/bin/env python3
-"""High-reliability local video transcription.
-
-Pipeline: FFmpeg audio extraction -> faster-whisper large-v3 -> optional
-WhisperX alignment -> SRT/VTT/TXT/JSON output. Everything runs locally.
-
-Example:
-    python scripts/transcribe.py video.mp4
-    python scripts/transcribe.py video.mp4 --language fr --output-dir output
-
-Notes:
-- Whisper is the source of truth; no LLM is allowed to rewrite the transcript.
-- Word timestamps are preserved in JSON and used to build subtitle timings.
-- A checkpoint is written so an interrupted long transcription can resume.
-- Hugging Face models are cached in <cwd>/aimodels.
-- Windows symlink creation is disabled so model downloads work without admin
-  privileges or Windows Developer Mode.
-"""
-
+"""High-reliability local video transcription with optional live output."""
 from __future__ import annotations
 
 import argparse
@@ -29,15 +12,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Keep all AI/model caches inside the project working directory.
 AI_MODELS_DIR = Path.cwd() / "aimodels"
 AI_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 os.environ["HF_HOME"] = str(AI_MODELS_DIR)
 os.environ["HF_HUB_CACHE"] = str(AI_MODELS_DIR / "hub")
 os.environ["HF_ASSETS_CACHE"] = str(AI_MODELS_DIR / "assets")
 os.environ["TRANSFORMERS_CACHE"] = str(AI_MODELS_DIR / "transformers")
-# Windows users commonly do not have SeCreateSymbolicLinkPrivilege.
-# Hugging Face supports this mode by copying files instead of creating symlinks.
 os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
@@ -46,7 +26,6 @@ try:
 except ImportError:
     print("ERROR: faster-whisper is not installed. Run: pip install -r requirements-transcription.txt")
     raise
-
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".ts", ".mts", ".m2ts"}
 
@@ -64,9 +43,7 @@ def require_ffmpeg() -> None:
 def media_duration(path: Path) -> float:
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
-        capture_output=True,
-        text=True,
-        check=True,
+        capture_output=True, text=True, check=True,
     )
     return float(result.stdout.strip())
 
@@ -89,11 +66,7 @@ def extract_audio(video: Path, wav: Path) -> None:
     if wav.exists() and wav.stat().st_size > 0:
         print(f"[OK] Reusing extracted audio: {wav}")
         return
-    run([
-        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-        "-i", str(video), "-vn", "-ac", "1", "-ar", "16000",
-        "-c:a", "pcm_s16le", str(wav),
-    ])
+    run(["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wav)])
 
 
 def save_checkpoint(path: Path, data: dict[str, Any]) -> None:
@@ -114,14 +87,9 @@ def load_checkpoint(path: Path) -> dict[str, Any] | None:
 def segment_to_dict(segment: Any) -> dict[str, Any]:
     words = []
     for word in (segment.words or []):
-        words.append({
-            "word": word.word,
-            "start": word.start,
-            "end": word.end,
-            "probability": getattr(word, "probability", None),
-        })
+        words.append({"word": word.word, "start": word.start, "end": word.end, "probability": getattr(word, "probability", None)})
     return {
-        "id": len(words),
+        "id": 0,
         "start": segment.start,
         "end": segment.end,
         "text": segment.text.strip(),
@@ -134,31 +102,18 @@ def segment_to_dict(segment: Any) -> dict[str, Any]:
 
 def write_outputs(out: Path, segments: list[dict[str, Any]], info: Any, source: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
-
     for i, segment in enumerate(segments, 1):
         segment["id"] = i
-
     srt_lines: list[str] = []
     vtt_lines: list[str] = ["WEBVTT", ""]
     txt_lines: list[str] = []
-
     for i, seg in enumerate(segments, 1):
         text = seg["text"].strip()
         if not text:
             continue
-        srt_lines.extend([
-            str(i),
-            f"{fmt_time(seg['start'])} --> {fmt_time(seg['end'])}",
-            text,
-            "",
-        ])
-        vtt_lines.extend([
-            f"{fmt_time(seg['start'], False)} --> {fmt_time(seg['end'], False)}",
-            text,
-            "",
-        ])
+        srt_lines.extend([str(i), f"{fmt_time(seg['start'])} --> {fmt_time(seg['end'])}", text, ""])
+        vtt_lines.extend([f"{fmt_time(seg['start'], False)} --> {fmt_time(seg['end'], False)}", text, ""])
         txt_lines.append(f"[{fmt_time(seg['start'], False)}] {text}")
-
     metadata = {
         "source": str(source.resolve()),
         "duration_seconds": media_duration(source),
@@ -166,29 +121,33 @@ def write_outputs(out: Path, segments: list[dict[str, Any]], info: Any, source: 
         "language_probability": getattr(info, "language_probability", None),
         "segments": segments,
     }
-
     (out / "transcript.srt").write_text("\n".join(srt_lines), encoding="utf-8")
     (out / "transcript.vtt").write_text("\n".join(vtt_lines), encoding="utf-8")
     (out / "transcript.txt").write_text("\n".join(txt_lines) + "\n", encoding="utf-8")
     (out / "transcript.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-
     words = []
     for seg in segments:
         words.extend(seg.get("words", []))
     (out / "transcript_words.json").write_text(json.dumps(words, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def print_live(segment: dict[str, Any], duration: float, index: int) -> None:
+    progress = min(100.0, (float(segment["end"]) / duration) * 100.0) if duration else 0.0
+    print(f"[LIVE {index:05d}] {progress:6.2f}% | {fmt_time(segment['start'], False)} -> {fmt_time(segment['end'], False)} | {segment['text']}", flush=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="High-reliability local Whisper transcription")
     parser.add_argument("video", type=Path, help="Input video file")
-    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory (default: <video>_transcript)")
-    parser.add_argument("--language", default=None, help="Language code, e.g. en or fr. Auto-detect if omitted.")
-    parser.add_argument("--model", default="large-v3", help="Whisper model (default: large-v3)")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Inference device")
-    parser.add_argument("--compute-type", default=None, help="faster-whisper compute type; auto selects float16 on CUDA")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--language", default=None)
+    parser.add_argument("--model", default="large-v3")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    parser.add_argument("--compute-type", default=None)
     parser.add_argument("--beam-size", type=int, default=5)
-    parser.add_argument("--no-previous-text", action="store_true", help="Disable cross-segment context")
+    parser.add_argument("--no-previous-text", action="store_true")
     parser.add_argument("--no-word-timestamps", action="store_true")
+    parser.add_argument("--live", action="store_true", help="Print every accepted Whisper segment immediately")
     args = parser.parse_args()
 
     video = args.video.expanduser().resolve()
@@ -197,7 +156,6 @@ def main() -> int:
         return 2
     if video.suffix.lower() not in VIDEO_EXTENSIONS:
         print(f"WARNING: Unusual video extension: {video.suffix}")
-
     require_ffmpeg()
     if shutil.which("ffprobe") is None:
         raise RuntimeError("ffprobe was not found in PATH. It is normally included with FFmpeg.")
@@ -206,15 +164,15 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out / "transcription_checkpoint.json"
     wav = out / "audio_16k_mono.wav"
-
     duration = media_duration(video)
+
     print(f"\nVIDEO:    {video}")
     print(f"DURATION: {fmt_time(duration, False)}")
     print(f"OUTPUT:   {out}")
-    print(f"AI MODELS:{AI_MODELS_DIR}\n")
+    print(f"AI MODELS:{AI_MODELS_DIR}")
+    print(f"LIVE:     {'ON - every accepted segment will print immediately' if args.live else 'OFF'}\n")
 
     extract_audio(video, wav)
-
     compute_type = args.compute_type or ("float16" if args.device == "cuda" else "int8")
     print(f"[MODEL] Loading {args.model} | device={args.device} | compute={compute_type}", flush=True)
     model = WhisperModel(args.model, device=args.device, compute_type=compute_type, download_root=str(AI_MODELS_DIR))
@@ -222,7 +180,6 @@ def main() -> int:
     checkpoint = load_checkpoint(checkpoint_path)
     segments: list[dict[str, Any]] = checkpoint.get("segments", []) if checkpoint else []
     completed_end = float(checkpoint.get("completed_end", 0.0)) if checkpoint else 0.0
-
     resume_from = max(0.0, completed_end - 1.5) if segments else 0.0
     if resume_from > 0:
         print(f"[RESUME] Continuing near {fmt_time(resume_from, False)}")
@@ -232,7 +189,7 @@ def main() -> int:
         "temperature": 0,
         "word_timestamps": not args.no_word_timestamps,
         "condition_on_previous_text": not args.no_previous_text,
-        "vad_filter": False,
+        "vad_filter": True,
         "chunk_length": 30,
         "without_timestamps": False,
     }
@@ -243,40 +200,52 @@ def main() -> int:
 
     print("[TRANSCRIBE] Starting...", flush=True)
     stream, info = model.transcribe(str(wav), **kwargs)
-
     new_segments: list[dict[str, Any]] = []
+    last_end = resume_from
+    live_index = len(segments) + 1
+
     for segment in stream:
         item = segment_to_dict(segment)
-        if item["text"]:
-            new_segments.append(item)
-        progress = min(100.0, (float(segment.end) / duration) * 100.0) if duration else 0
-        print(
-            f"\r[PROGRESS] {progress:6.2f}% | {fmt_time(segment.start, False)} -> {fmt_time(segment.end, False)} | {item['text'][:100]}",
-            end="",
-            flush=True,
-        )
+        start = float(item["start"])
+        end = float(item["end"])
+
+        # Hard monotonic guard: never accept a segment that goes backwards or
+        # duplicates the same time span. This protects live output and resumes.
+        if end <= start or end <= last_end + 0.05:
+            continue
+        if new_segments and start < float(new_segments[-1]["end"]) - 0.05:
+            continue
+        if not item["text"]:
+            continue
+
+        new_segments.append(item)
+        last_end = end
+        if args.live:
+            print_live(item, duration, live_index)
+            live_index += 1
+        else:
+            progress = min(100.0, (end / duration) * 100.0) if duration else 0.0
+            print(f"\r[PROGRESS] {progress:6.2f}% | {fmt_time(start, False)} -> {fmt_time(end, False)}", end="", flush=True)
+
         save_checkpoint(checkpoint_path, {
             "source": str(video),
             "model": args.model,
             "language": getattr(info, "language", None),
-            "completed_end": segment.end,
+            "completed_end": end,
             "segments": segments + new_segments,
         })
 
     print("\n[OK] Whisper transcription complete.")
-
     if segments and resume_from > 0:
         segments = [s for s in segments if float(s["end"]) < resume_from]
     segments.extend(new_segments)
     segments.sort(key=lambda x: (float(x["start"]), float(x["end"])))
-
     write_outputs(out, segments, info, video)
     checkpoint_path.unlink(missing_ok=True)
 
     print("\n[DONE] Files:")
     for name in ["transcript.srt", "transcript.vtt", "transcript.txt", "transcript.json", "transcript_words.json"]:
         print(f"  {out / name}")
-    print("\nNOTE: For maximum reliability, review low-confidence/overlapping speech in the JSON/audio. No LLM rewriting is performed.")
     return 0
 
 
