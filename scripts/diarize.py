@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import warnings
 import wave
@@ -36,12 +37,57 @@ def read_pcm_wav(path: Path):
             f"sample_width={sample_width}, sample_rate={sample_rate}"
         )
 
-    audio = torch.frombuffer(frames, dtype=torch.int16).clone().float() / 32768.0
+    # Copy through bytearray so torch does not receive a non-writable buffer.
+    audio = torch.frombuffer(bytearray(frames), dtype=torch.int16).float() / 32768.0
     return audio.unsqueeze(0), sample_rate
 
 
 def write_status(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def configure_quiet_output() -> None:
+    warnings.filterwarnings(
+        "ignore",
+        message=r"torchcodec is not installed correctly.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*built-in audio decoding will fail.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"The given buffer is not writable.*",
+        category=UserWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r"TensorFloat-32 \(TF32\) has been disabled.*",
+        category=UserWarning,
+    )
+
+    logging.getLogger("pyannote.audio.core.io").setLevel(logging.ERROR)
+
+
+def extract_segments(output):
+    """Return (turn, speaker) tuples for pyannote 4.x and older outputs."""
+    # Community-1 exposes both standard and exclusive annotations. The
+    # exclusive version is preferable when reconciling against ASR timestamps.
+    annotation = getattr(output, "exclusive_speaker_diarization", None)
+    source = "exclusive_speaker_diarization"
+    if annotation is None:
+        annotation = getattr(output, "speaker_diarization", None)
+        source = "speaker_diarization"
+    if annotation is not None:
+        return [(turn, speaker) for turn, speaker in annotation], source
+
+    # Legacy pyannote outputs may be Annotation objects directly.
+    if hasattr(output, "itertracks"):
+        return list(output.itertracks(yield_label=True)), "legacy_itertracks"
+
+    raise RuntimeError(f"Unsupported pyannote output type: {type(output).__name__}")
 
 
 def main() -> int:
@@ -57,6 +103,8 @@ def main() -> int:
     args = p.parse_args()
 
     load_env_file()
+    configure_quiet_output()
+
     out = args.output_dir.resolve()
     out.mkdir(parents=True, exist_ok=True)
     status_path = out / "diarization_status.json"
@@ -70,11 +118,6 @@ def main() -> int:
         if args.strict:
             raise RuntimeError(f"Speaker diarization requires HF_TOKEN and accepted access to {MODEL_ID}")
         return 0
-
-    # We feed pyannote an in-memory waveform below, so the optional TorchCodec
-    # decoder warning is not relevant to this execution path on Windows.
-    warnings.filterwarnings("ignore", message="torchcodec is not installed correctly.*", module="pyannote.audio")
-    warnings.filterwarnings("ignore", message=".*built-in audio decoding will fail.*", module="pyannote.audio")
 
     try:
         import torch
@@ -106,7 +149,11 @@ def main() -> int:
         pipeline.to(torch.device(args.device))
     except Exception as e:
         error_text = str(e)
-        is_access_error = "403 Client Error" in error_text or "Cannot access gated repo" in error_text or "not in the authorized list" in error_text
+        is_access_error = (
+            "403 Client Error" in error_text
+            or "Cannot access gated repo" in error_text
+            or "not in the authorized list" in error_text
+        )
         if is_access_error:
             print("[DIARIZE] Hugging Face denied access to the diarization model.", flush=True)
             print(f"[DIARIZE] Accept access for: {MODEL_ID}", flush=True)
@@ -141,8 +188,17 @@ def main() -> int:
             raise
         return 0
 
+    try:
+        tracks, output_source = extract_segments(diarization)
+    except Exception as e:
+        print(f"[DIARIZE] Could not read pyannote output: {e}", flush=True)
+        write_status(status_path, {"status": "failed", "reason": "output_parse_failed", "model": MODEL_ID, "error": str(e)})
+        if args.strict:
+            raise
+        return 0
+
     rows = []
-    for index, (turn, _, speaker) in enumerate(diarization.itertracks(yield_label=True), 1):
+    for index, (turn, speaker) in enumerate(tracks, 1):
         row = {"start": float(turn.start), "end": float(turn.end), "speaker": str(speaker)}
         rows.append(row)
         if args.live:
@@ -150,13 +206,23 @@ def main() -> int:
 
     (out / "diarization.json").write_text(
         json.dumps(
-            {"audio": str(audio_path), "model": MODEL_ID, "device": args.device, "segments": rows},
+            {
+                "audio": str(audio_path),
+                "model": MODEL_ID,
+                "device": args.device,
+                "segments": rows,
+                "output_source": output_source,
+                "exclusive": output_source == "exclusive_speaker_diarization",
+            },
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
-    write_status(status_path, {"status": "complete", "segments": len(rows), "model": MODEL_ID})
+    write_status(
+        status_path,
+        {"status": "complete", "segments": len(rows), "model": MODEL_ID, "output_source": output_source},
+    )
     print(f"[OK] {len(rows)} speaker regions -> {out / 'diarization.json'}", flush=True)
     return 0
 
