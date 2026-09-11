@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import warnings
 import wave
 from pathlib import Path
 
@@ -39,6 +40,10 @@ def read_pcm_wav(path: Path):
     return audio.unsqueeze(0), sample_rate
 
 
+def write_status(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Local speaker diarization with pyannote")
     p.add_argument("--audio", type=Path, required=True)
@@ -60,46 +65,39 @@ def main() -> int:
     if not token:
         message = "HF_TOKEN is not configured; speaker diarization skipped."
         print(f"[DIARIZE] {message}", flush=True)
-        status_path.write_text(
-            json.dumps({"status": "skipped", "reason": "missing_hf_token", "model": MODEL_ID}, indent=2),
-            encoding="utf-8",
-        )
+        print("[DIARIZE] Add HF_TOKEN to .env and accept the model access conditions on Hugging Face.", flush=True)
+        write_status(status_path, {"status": "skipped", "reason": "missing_hf_token", "model": MODEL_ID})
         if args.strict:
-            raise RuntimeError(
-                "Speaker diarization requires HF_TOKEN and accepted access to "
-                f"{MODEL_ID}"
-            )
+            raise RuntimeError(f"Speaker diarization requires HF_TOKEN and accepted access to {MODEL_ID}")
         return 0
+
+    # We feed pyannote an in-memory waveform below, so the optional TorchCodec
+    # decoder warning is not relevant to this execution path on Windows.
+    warnings.filterwarnings("ignore", message="torchcodec is not installed correctly.*", module="pyannote.audio")
+    warnings.filterwarnings("ignore", message=".*built-in audio decoding will fail.*", module="pyannote.audio")
 
     try:
         import torch
         from pyannote.audio import Pipeline
     except ImportError as e:
+        message = "pyannote.audio/torch is unavailable; speaker diarization skipped."
+        print(f"[DIARIZE] {message}", flush=True)
+        write_status(status_path, {"status": "skipped", "reason": "pyannote_or_torch_unavailable", "model": MODEL_ID})
         if args.strict:
             raise RuntimeError("Install pyannote.audio and torch: pip install pyannote.audio torch") from e
-        print("[DIARIZE] pyannote.audio/torch unavailable; speaker diarization skipped.", flush=True)
-        status_path.write_text(
-            json.dumps({"status": "skipped", "reason": "pyannote_or_torch_unavailable", "model": MODEL_ID}, indent=2),
-            encoding="utf-8",
-        )
         return 0
 
     audio_path = args.audio.resolve()
     if not audio_path.exists():
         message = f"Audio not found: {audio_path}"
         print(f"[DIARIZE] {message}", flush=True)
-        status_path.write_text(
-            json.dumps({"status": "skipped", "reason": "audio_missing", "model": MODEL_ID}, indent=2),
-            encoding="utf-8",
-        )
+        write_status(status_path, {"status": "skipped", "reason": "audio_missing", "model": MODEL_ID})
         if args.strict:
             raise FileNotFoundError(audio_path)
         return 0
 
     print(f"[DIARIZE] Loading pyannote pipeline: {MODEL_ID}", flush=True)
     try:
-        # pyannote 4.x uses token=, not the removed use_auth_token= argument.
-        # Keep its Hugging Face cache inside the project's local model directory.
         pipeline = Pipeline.from_pretrained(
             MODEL_ID,
             token=token,
@@ -107,17 +105,19 @@ def main() -> int:
         )
         pipeline.to(torch.device(args.device))
     except Exception as e:
-        status_path.write_text(
-            json.dumps(
-                {"status": "failed", "reason": "pipeline_load_failed", "model": MODEL_ID, "error": str(e)},
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        error_text = str(e)
+        is_access_error = "403 Client Error" in error_text or "Cannot access gated repo" in error_text or "not in the authorized list" in error_text
+        if is_access_error:
+            print("[DIARIZE] Hugging Face denied access to the diarization model.", flush=True)
+            print(f"[DIARIZE] Accept access for: {MODEL_ID}", flush=True)
+            print("[DIARIZE] Then rerun the diarization stage; your token is already read from .env.", flush=True)
+            reason = "huggingface_model_access_denied"
+        else:
+            print(f"[DIARIZE] Pipeline could not be loaded; speaker diarization skipped: {e}", flush=True)
+            reason = "pipeline_load_failed"
+        write_status(status_path, {"status": "skipped", "reason": reason, "model": MODEL_ID, "error": error_text})
         if args.strict:
             raise
-        print(f"[DIARIZE] Pipeline could not be loaded; speaker diarization skipped: {e}", flush=True)
         return 0
 
     kwargs = {}
@@ -126,8 +126,6 @@ def main() -> int:
     if args.max_speakers is not None:
         kwargs["max_speakers"] = args.max_speakers
 
-    # Feed an in-memory waveform so pyannote does not rely on TorchCodec's
-    # Windows DLL-based audio decoding.
     waveform, sample_rate = read_pcm_wav(audio_path)
     input_data = {"waveform": waveform, "sample_rate": sample_rate}
     duration = waveform.shape[-1] / sample_rate
@@ -136,17 +134,11 @@ def main() -> int:
     try:
         diarization = pipeline(input_data, **kwargs)
     except Exception as e:
-        status_path.write_text(
-            json.dumps(
-                {"status": "failed", "reason": "inference_failed", "model": MODEL_ID, "error": str(e)},
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+        error_text = str(e)
+        print(f"[DIARIZE] Inference failed; speaker diarization skipped: {error_text}", flush=True)
+        write_status(status_path, {"status": "failed", "reason": "inference_failed", "model": MODEL_ID, "error": error_text})
         if args.strict:
             raise
-        print(f"[DIARIZE] Inference failed; speaker diarization skipped: {e}", flush=True)
         return 0
 
     rows = []
@@ -154,10 +146,7 @@ def main() -> int:
         row = {"start": float(turn.start), "end": float(turn.end), "speaker": str(speaker)}
         rows.append(row)
         if args.live:
-            print(
-                f"[DIAR {index:05d}] {turn.start:09.3f} -> {turn.end:09.3f} | {speaker}",
-                flush=True,
-            )
+            print(f"[DIAR {index:05d}] {turn.start:09.3f} -> {turn.end:09.3f} | {speaker}", flush=True)
 
     (out / "diarization.json").write_text(
         json.dumps(
@@ -167,10 +156,7 @@ def main() -> int:
         ),
         encoding="utf-8",
     )
-    status_path.write_text(
-        json.dumps({"status": "complete", "segments": len(rows), "model": MODEL_ID}, indent=2),
-        encoding="utf-8",
-    )
+    write_status(status_path, {"status": "complete", "segments": len(rows), "model": MODEL_ID})
     print(f"[OK] {len(rows)} speaker regions -> {out / 'diarization.json'}", flush=True)
     return 0
 
