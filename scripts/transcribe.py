@@ -4,8 +4,6 @@
 Pipeline: FFmpeg audio extraction -> faster-whisper large-v3 -> optional
 WhisperX alignment -> SRT/VTT/TXT/JSON output. Everything runs locally.
 
-AI model/cache files are stored in <current working directory>\\aimodels.
-
 Example:
     python scripts/transcribe.py video.mp4
     python scripts/transcribe.py video.mp4 --language fr --output-dir output
@@ -14,6 +12,9 @@ Notes:
 - Whisper is the source of truth; no LLM is allowed to rewrite the transcript.
 - Word timestamps are preserved in JSON and used to build subtitle timings.
 - A checkpoint is written so an interrupted long transcription can resume.
+- Hugging Face models are cached in <cwd>/aimodels.
+- Windows symlink creation is disabled so model downloads work without admin
+  privileges or Windows Developer Mode.
 """
 
 from __future__ import annotations
@@ -28,15 +29,17 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Keep Hugging Face/faster-whisper model files local to the project working
-# directory instead of C:\\Users\\<user>\\.cache. This must happen before
-# importing faster_whisper/huggingface_hub.
+# Keep all AI/model caches inside the project working directory.
 AI_MODELS_DIR = Path.cwd() / "aimodels"
 AI_MODELS_DIR.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("HF_HOME", str(AI_MODELS_DIR))
-os.environ.setdefault("HF_HUB_CACHE", str(AI_MODELS_DIR / "hub"))
-os.environ.setdefault("HF_ASSETS_CACHE", str(AI_MODELS_DIR / "assets"))
-os.environ.setdefault("XDG_CACHE_HOME", str(AI_MODELS_DIR / "xdg"))
+os.environ["HF_HOME"] = str(AI_MODELS_DIR)
+os.environ["HF_HUB_CACHE"] = str(AI_MODELS_DIR / "hub")
+os.environ["HF_ASSETS_CACHE"] = str(AI_MODELS_DIR / "assets")
+os.environ["TRANSFORMERS_CACHE"] = str(AI_MODELS_DIR / "transformers")
+# Windows users commonly do not have SeCreateSymbolicLinkPrivilege.
+# Hugging Face supports this mode by copying files instead of creating symlinks.
+os.environ["HF_HUB_DISABLE_SYMLINKS"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
 try:
     from faster_whisper import WhisperModel
@@ -132,7 +135,6 @@ def segment_to_dict(segment: Any) -> dict[str, Any]:
 def write_outputs(out: Path, segments: list[dict[str, Any]], info: Any, source: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
-    # Re-number segments after all merging/checkpointing.
     for i, segment in enumerate(segments, 1):
         segment["id"] = i
 
@@ -215,14 +217,12 @@ def main() -> int:
 
     compute_type = args.compute_type or ("float16" if args.device == "cuda" else "int8")
     print(f"[MODEL] Loading {args.model} | device={args.device} | compute={compute_type}", flush=True)
-    model = WhisperModel(args.model, device=args.device, compute_type=compute_type)
+    model = WhisperModel(args.model, device=args.device, compute_type=compute_type, download_root=str(AI_MODELS_DIR))
 
     checkpoint = load_checkpoint(checkpoint_path)
     segments: list[dict[str, Any]] = checkpoint.get("segments", []) if checkpoint else []
     completed_end = float(checkpoint.get("completed_end", 0.0)) if checkpoint else 0.0
 
-    # Resume from the last completed segment. We deliberately keep a tiny overlap
-    # so a word crossing a restart boundary is not lost.
     resume_from = max(0.0, completed_end - 1.5) if segments else 0.0
     if resume_from > 0:
         print(f"[RESUME] Continuing near {fmt_time(resume_from, False)}")
@@ -258,13 +258,13 @@ def main() -> int:
         save_checkpoint(checkpoint_path, {
             "source": str(video),
             "model": args.model,
+            "language": getattr(info, "language", None),
             "completed_end": segment.end,
             "segments": segments + new_segments,
         })
 
     print("\n[OK] Whisper transcription complete.")
 
-    # Replace the overlapped tail with the fresh pass, avoiding duplicate segments.
     if segments and resume_from > 0:
         segments = [s for s in segments if float(s["end"]) < resume_from]
     segments.extend(new_segments)
