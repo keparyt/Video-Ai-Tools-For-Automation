@@ -24,7 +24,7 @@ def main():
     p.add_argument("--skip-vad",action="store_true")
     p.add_argument("--skip-diarize",action="store_true")
     p.add_argument("--force",action="store_true",help="Delete the existing workflow output before starting")
-    p.add_argument("--live",action="store_true",help="Print every accepted transcription segment immediately")
+    p.add_argument("--live",action="store_true",help="Print live progress from supported stages")
     args=p.parse_args()
     video=args.video.resolve(); out=(args.output_dir or video.with_name(video.stem+"_transcript")).resolve()
     if args.force and out.exists():
@@ -38,7 +38,11 @@ def main():
         if args.compute_type: transcribe_args += ["--compute-type",args.compute_type]
         if args.live: transcribe_args += ["--live"]
         call("transcribe.py",transcribe_args)
-    if args.stage in ("all","vad") and not args.skip_vad: call("vad.py",["--input",str(audio),*common])
+    if args.stage in ("all","vad") and not args.skip_vad:
+        vad_input=audio if audio.exists() else video
+        vad_args=["--input",str(vad_input),*common]
+        if args.live: vad_args += ["--live"]
+        call("vad.py",vad_args)
     if args.stage in ("all","align"): call("align.py",["--transcript",str(transcript),"--audio",str(audio),*common,"--device",args.device,*( ["--language",args.language] if args.language else [] ),*( ["--compute-type",args.compute_type] if args.compute_type else [] )])
     if args.stage in ("all","diarize") and not args.skip_diarize: call("diarize.py",["--audio",str(audio),*common])
     if args.stage in ("all","verify"): call("verify.py",["--transcript",str(transcript),*common])
